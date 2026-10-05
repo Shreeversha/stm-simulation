@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scanning Tunneling Microscope Simulation</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff;
+    box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  html { scroll-padding-top:env(safe-area-inset-top,0px); }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column; align-items:center; }
+  h1 { margin:0; font-size:1.3rem; font-weight:600; }
+  .wrap { width:100%; max-width:1000px; display:flex; flex-direction:column; gap:12px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px 16px; }
+  .explain { line-height:1.5; color:var(--muted); font-size:.95rem; }
+  .explain b { color:var(--text); }
+  .canvas-box { position:relative; width:100%; aspect-ratio:16/9; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; border:1px solid var(--border); border-radius:10px; background:#05080d; }
+  .readouts { display:flex; flex-wrap:wrap; gap:12px; }
+  .readout { flex:1 1 200px; background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:8px 12px; }
+  .readout .label { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .readout .value { font-size:1.4rem; font-family:ui-monospace,Consolas,monospace; }
+  .bar-track { height:8px; background:#21262d; border-radius:4px; margin-top:6px; overflow:hidden; }
+  .bar-fill { height:100%; width:0%; border-radius:4px; }
+  .controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+  .control label { display:flex; justify-content:space-between; font-size:.9rem; margin-bottom:4px; }
+  .control .val { font-family:ui-monospace,Consolas,monospace; color:var(--accent); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Scanning Tunneling Microscope (STM) — Tunneling Current vs. Distance</h1>
+  <div class="panel explain">
+    An STM works by <b>quantum tunneling</b>: electrons can cross the tiny vacuum gap between a sharp metal tip and a
+    conducting surface even though classically they lack the energy to do so. The resulting
+    <b>tunneling current decays exponentially</b> with tip–sample distance, I ∝ e<sup>−2κd</sup>, so a change of just
+    one Ångström changes the current by roughly an order of magnitude. In real instruments this extreme sensitivity
+    is what lets the STM resolve <b>individual atoms</b>.
+  </div>
+  <div class="canvas-box"><canvas id="stm"></canvas></div>
+  <div class="readouts">
+    <div class="readout"><div class="label">Tip–sample distance d</div><div class="value" id="distVal">–</div></div>
+    <div class="readout"><div class="label">Tunneling current I (normalized)</div><div class="value" id="curVal">–</div>
+      <div class="bar-track"><div class="bar-fill" id="curBar"></div></div></div>
+  </div>
+  <div class="panel controls">
+    <div class="control"><label>Average tip height <span class="val" id="hLabel"></span></label>
+      <input type="range" id="height" min="1" max="20" step="0.1" value="6"></div>
+    <div class="control"><label>Scan speed <span class="val" id="sLabel"></span></label>
+      <input type="range" id="speed" min="0" max="3" step="0.05" value="0.8"></div>
+    <div class="control"><label>Decay constant κ <span class="val" id="kLabel"></span></label>
+      <input type="range" id="kappa" min="0.3" max="2.0" step="0.05" value="1.0"></div>
+    <div class="control"><label>Tip position x <span class="val" id="xLabel"></span></label>
+      <input type="range" id="xpos" min="0" max="100" step="0.1" value="50">
+      <div style="margin-top:6px;font-size:.9rem"><input type="checkbox" id="auto" checked style="accent-color:#58a6ff"> <label for="auto" style="display:inline">Auto-scan (untick to place the tip by hand)</label></div></div>
+    <div class="control"><label>Tunneling current I (log scale) <span class="val" id="iLabel"></span></label>
+      <input type="range" id="setI" min="-3" max="1" step="0.02" value="-1"></div>
+  </div>
+</div>
+
+<script>
+/* STM simulation. Physics: I(d) = I0 * exp(-2*kappa*d). Units: Ångström-like. */
+const WORLD_W = 40, WORLD_H = 22.5;   // visible world size (16:9)
+const SURFACE_BASE = 4;               // mean surface level
+const ATOM_SPACING = 4;               // lattice constant
+const BUMP_AMPLITUDE = 0.9;           // corrugation amplitude
+const I0 = 1.0;                       // current prefactor
+const D_REF = 3;                      // reference distance for normalization
+const SCAN_RANGE = 30, SCAN_CENTER = WORLD_W / 2;
+
+const $ = id => document.getElementById(id);
+const canvas = $('stm'), ctx = canvas.getContext('2d');
+const heightEl = $('height'), speedEl = $('speed'), kappaEl = $('kappa');
+
+// All sliders are always live. Tip height and current are two views of the same gap:
+// dragging the current slider moves the tip to whatever height gives that current
+// (under the tip's present position); dragging the height slider changes the current.
+let draggingI = false, lastTipX = SCAN_CENTER;
+const setIEl = $('setI'), xposEl = $('xpos');
+setIEl.addEventListener('input', () => {
+  draggingI = true;
+  const k = parseFloat(kappaEl.value);
+  const I = Math.pow(10, parseFloat(setIEl.value)) * tunnelingCurrent(D_REF, k);
+  const d = -Math.log(I / I0) / (2 * k);
+  heightEl.value = Math.max(1, Math.min(20, surfaceHeight(lastTipX) + d - SURFACE_BASE));
+});
+['change', 'pointerup', 'pointercancel'].forEach(e => setIEl.addEventListener(e, () => { draggingI = false; }));
+xposEl.addEventListener('input', () => { $('auto').checked = false; });
+
+let scanPhase = 0, lastTime = null, tipTrail = [], traceLabel = '';
+const TRAIL_MAX = 400;
+
+// Responsive, high-DPI canvas
+let W = 0, H = 0;
+function resize() {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  W = r.width; H = r.height;
+}
+window.addEventListener('resize', resize); resize();
+
+// World units -> pixels
+const sx = x => x / WORLD_W * W, sy = y => H - y / WORLD_H * H, sl = l => l / WORLD_W * W;
+
+// ---- Physics ----
+const surfaceHeight = x => SURFACE_BASE + BUMP_AMPLITUDE * Math.cos(2 * Math.PI * x / ATOM_SPACING);
+const tunnelingCurrent = (d, k) => I0 * Math.exp(-2 * k * d);
+const normalizedCurrent = (I, k) => I / tunnelingCurrent(D_REF, k);
+
+// Color: dim blue (low) -> green -> bright yellow (high)
+function currentColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  return `hsl(${220 - 160 * t}, 85%, ${22 + 40 * t}%)`;
+}
+// Log-scale 0..1 level so the whole exponential range is visible
+function currentToLevel(In) {
+  return Math.max(0, Math.min(1, (Math.log10(Math.max(In, 1e-12)) + 4) / 5));
+}
+const font = (min, f) => `${Math.max(min, W * f)}px system-ui, sans-serif`;
+
+// ---- Drawing ----
+function drawSample() {
+  const steps = 300;
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let i = 0; i <= steps; i++) { const x = i / steps * WORLD_W; ctx.lineTo(sx(x), sy(surfaceHeight(x))); }
+  ctx.lineTo(W, H); ctx.closePath();
+  const g = ctx.createLinearGradient(0, sy(SURFACE_BASE + 1), 0, H);
+  g.addColorStop(0, '#6e7681'); g.addColorStop(1, '#21262d');
+  ctx.fillStyle = g; ctx.fill();
+
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const x = i / steps * WORLD_W;
+    i ? ctx.lineTo(sx(x), sy(surfaceHeight(x))) : ctx.moveTo(sx(x), sy(surfaceHeight(x)));
+  }
+  ctx.strokeStyle = '#c9d1d9'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Atoms under each cosine peak
+  const r = ATOM_SPACING * 0.42;
+  for (let x = 0; x <= WORLD_W + ATOM_SPACING; x += ATOM_SPACING) {
+    const cy = surfaceHeight(x) - r * 0.55;
+    const rg = ctx.createRadialGradient(sx(x) - sl(r) * .3, sy(cy) - sl(r) * .3, sl(r) * .1, sx(x), sy(cy), sl(r));
+    rg.addColorStop(0, '#b6bec8'); rg.addColorStop(1, '#4b535c');
+    ctx.beginPath(); ctx.arc(sx(x), sy(cy), sl(r), 0, Math.PI * 2); ctx.fillStyle = rg; ctx.fill();
+  }
+  ctx.fillStyle = '#c9d1d9'; ctx.font = font(12, .016); ctx.textAlign = 'left';
+  ctx.fillText('Sample surface', 12, H - 12);
+}
+
+function drawTip(tipX, tipY, level) {
+  const th = 9, hw = 2.2, color = currentColor(level);
+  // Glow grows and brightens with current
+  const gr = sl(1.2 + 3.5 * level);
+  const glow = ctx.createRadialGradient(sx(tipX), sy(tipY), 0, sx(tipX), sy(tipY), gr);
+  glow.addColorStop(0, color); glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.globalAlpha = 0.25 + 0.75 * level; ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(sx(tipX), sy(tipY), gr, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Probe arm
+  ctx.fillStyle = '#484f58';
+  ctx.fillRect(sx(tipX - hw), sy(tipY + th + 20), sl(hw * 2), sy(tipY + th) - sy(tipY + th + 20));
+
+  // Triangle tip
+  ctx.beginPath(); ctx.moveTo(sx(tipX), sy(tipY));
+  ctx.lineTo(sx(tipX - hw), sy(tipY + th)); ctx.lineTo(sx(tipX + hw), sy(tipY + th)); ctx.closePath();
+  const tg = ctx.createLinearGradient(sx(tipX - hw), 0, sx(tipX + hw), 0);
+  tg.addColorStop(0, '#8b949e'); tg.addColorStop(.5, '#e6edf3'); tg.addColorStop(1, '#8b949e');
+  ctx.fillStyle = tg; ctx.fill(); ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1; ctx.stroke();
+
+  ctx.fillStyle = '#e6edf3'; ctx.font = font(12, .016); ctx.textAlign = 'left';
+  ctx.fillText('STM tip', sx(tipX + hw + 0.8), sy(tipY + th * 0.7));
+}
+
+function drawDistanceMarker(tipX, tipY, surfY) {
+  const px = sx(tipX), y1 = sy(tipY), y2 = sy(surfY);
+  ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = '#f0883e'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(px, y1); ctx.lineTo(px, y2); ctx.stroke(); ctx.restore();
+  ctx.beginPath(); ctx.moveTo(px - 5, y1); ctx.lineTo(px + 5, y1); ctx.moveTo(px - 5, y2); ctx.lineTo(px + 5, y2); ctx.stroke();
+  ctx.fillStyle = '#f0883e'; ctx.font = font(11, .014); ctx.textAlign = 'right';
+  ctx.fillText('Tip–sample distance', px - 10, (y1 + y2) / 2 + 4);
+}
+
+// Electron dots hop across the gap; more of them when current is higher
+function drawElectrons(tipX, tipY, surfY, level, time) {
+  const n = Math.round(1 + 10 * level);
+  ctx.fillStyle = currentColor(Math.max(level, 0.35));
+  for (let i = 0; i < n; i++) {
+    const ph = (time * (0.6 + 1.4 * level) + i / n) % 1;
+    const y = surfY + (tipY - surfY) * (1 - ph);
+    const j = Math.sin(time * 9 + i * 12.9898) * 0.35;
+    ctx.globalAlpha = 0.25 + 0.75 * level;
+    ctx.beginPath(); ctx.arc(sx(tipX + j), sy(y), 2.2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Strip chart of recent current (log scale)
+function drawTrace() {
+  const w = Math.min(280, W * .32), h = Math.min(90, H * .2), x0 = 12, y0 = 12;
+  ctx.fillStyle = 'rgba(13,17,23,0.85)'; ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+  ctx.fillRect(x0, y0, w, h); ctx.strokeRect(x0, y0, w, h);
+  ctx.fillStyle = '#8b949e'; ctx.font = font(10, .012); ctx.textAlign = 'left';
+  ctx.fillText(traceLabel, x0 + 6, y0 + 14);
+  if (tipTrail.length < 2) return;
+  ctx.beginPath();
+  tipTrail.forEach((v, i) => {
+    const px = x0 + 4 + i / (TRAIL_MAX - 1) * (w - 8), py = y0 + h - 6 - v * (h - 26);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  });
+  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 1.5; ctx.stroke();
+}
+
+// ---- Main loop ----
+function frame(now) {
+  if (lastTime === null) lastTime = now;
+  const dt = Math.min(0.05, (now - lastTime) / 1000); lastTime = now;
+
+  // Sliders are read every frame so changes apply instantly
+  const avgH = parseFloat(heightEl.value), speed = parseFloat(speedEl.value), kappa = parseFloat(kappaEl.value);
+  $('hLabel').textContent = avgH.toFixed(1) + ' Å';
+  $('sLabel').textContent = speed.toFixed(2) + '×';
+  $('kLabel').textContent = kappa.toFixed(2) + ' Å⁻¹';
+
+  // Tip sweeps back and forth at constant height
+  let tipX;
+  if ($('auto').checked) {
+    scanPhase += dt * speed * 0.6;
+    tipX = SCAN_CENTER + (SCAN_RANGE / 2) * Math.sin(scanPhase);
+    xposEl.value = (tipX - 5) / 0.3;          // keep the slider in sync
+  } else {
+    tipX = 5 + parseFloat(xposEl.value) * 0.3; // manual placement
+  }
+  lastTipX = tipX;
+  $('xLabel').textContent = tipX.toFixed(1) + ' Å';
+  const constCurrent = false;   // always constant-height; the sliders set the gap directly
+  const setI = Math.pow(10, parseFloat($('setI').value));   // user-chosen normalized current
+  $('iLabel').textContent = setI >= 0.01 ? setI.toFixed(2) : setI.toExponential(1);
+  const surfY = surfaceHeight(tipX);
+  let tipY, d, Inorm;
+  if (constCurrent) {
+    // Feedback loop: invert I = I0*exp(-2*kappa*d) to find the distance giving the set current
+    const I = setI * tunnelingCurrent(D_REF, kappa);
+    d = -Math.log(I / I0) / (2 * kappa);
+    tipY = surfY + d;                     // tip rides up and down over the atoms
+    Inorm = setI;
+  } else {
+    tipY = SURFACE_BASE + avgH;           // fixed height, current varies
+    d = tipY - surfY;
+    Inorm = normalizedCurrent(tunnelingCurrent(d, kappa), kappa);
+  }
+  const level = currentToLevel(Inorm);
+  if (!draggingI) setIEl.value = Math.log10(Math.max(Inorm, 1e-12));  // slider shows live current
+  $('iLabel').textContent = Inorm >= 0.01 ? Inorm.toFixed(2) : Inorm.toExponential(1);
+
+  // Trace: current in constant-height mode, tip height (the "image") in constant-current mode
+  traceLabel = constCurrent ? 'Tip height (topography) vs. scan' : 'Tunneling current (log scale) vs. scan';
+  tipTrail.push(constCurrent ? (surfY - SURFACE_BASE) / (2 * BUMP_AMPLITUDE) + 0.5 : level);
+  if (tipTrail.length > TRAIL_MAX) tipTrail.shift();
+
+  $('distVal').textContent = d.toFixed(2) + ' Å';
+  $('curVal').textContent = Inorm >= 0.01 ? Inorm.toFixed(3) : Inorm.toExponential(2);
+  $('curVal').style.color = currentColor(Math.max(level, 0.3));
+  $('curBar').style.width = (level * 100).toFixed(1) + '%';
+  $('curBar').style.background = currentColor(level);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = 'rgba(48,54,61,0.35)'; ctx.lineWidth = 1;
+  for (let gx = 0; gx <= WORLD_W; gx += 5) { ctx.beginPath(); ctx.moveTo(sx(gx), 0); ctx.lineTo(sx(gx), H); ctx.stroke(); }
+  for (let gy = 0; gy <= WORLD_H; gy += 5) { ctx.beginPath(); ctx.moveTo(0, sy(gy)); ctx.lineTo(W, sy(gy)); ctx.stroke(); }
+
+  drawSample();
+  drawElectrons(tipX, tipY, surfY, level, now / 1000);
+  drawDistanceMarker(tipX, tipY, surfY);
+  drawTip(tipX, tipY, level);
+  drawTrace();
+
+  ctx.fillStyle = currentColor(Math.max(level, 0.3)); ctx.font = font(12, .016); ctx.textAlign = 'left';
+  ctx.fillText('Tunneling current', sx(tipX) + 14, sy(tipY) + 24);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
